@@ -1,9 +1,6 @@
-"""Interactive setup wizard for ComfyGen.
+"""Interactive setup wizard for ComfyGen on Modal."""
 
-Creates RunPod serverless infrastructure (network volume + endpoint)
-and configures S3 storage. This is the only interactive command in
-the CLI — all other commands are agent-first / non-interactive.
-"""
+from __future__ import annotations
 
 import argparse
 import getpass
@@ -13,7 +10,7 @@ import sys
 import time
 from typing import Any
 
-from comfy_gen import config, output, runpod_api
+from comfy_gen import config, modal_client, output
 
 BANNER = r"""
    ______                 __       ______
@@ -25,66 +22,36 @@ BANNER = r"""
                               by HearmemanAI
 """
 
-TIERS: dict[str, dict[str, Any]] = {
-    "1": {
-        "name": "Budget",
-        "gpu_ids": ["NVIDIA GeForce RTX 5090"],
-        "datacenter": "EU-RO-1",
-        "label": "RTX 5090 (32GB)",
-        "region": "Europe — Romania",
-    },
-    "2": {
-        "name": "Recommended",
-        "gpu_ids": [
-            "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-            "NVIDIA A100-SXM4-80GB",
-        ],
-        "datacenter": "EUR-IS-1",
-        "label": "RTX PRO 6000 / A100 SXM (96/80GB)",
-        "region": "Europe — Iceland",
-    },
-    "3": {
-        "name": "Performance",
-        "gpu_ids": ["NVIDIA H100 NVL", "NVIDIA H100 PCIe"],
-        "datacenter": "US-KS-2",
-        "label": "H100 NVL / H100 PCIe (94/80GB)",
-        "region": "US — Kansas",
-    },
-}
+DEFAULT_APP_NAME = "comfy-gen"
+DEFAULT_VOLUME_NAME = "comfy-gen-comfyui"
+DEFAULT_SECRET_NAME = "comfy-gen-storage"
+DEFAULT_JOBS_NAME = "comfy-gen-jobs"
+DEFAULT_GPU = "H100!"
 
-DEFAULT_VOLUME_SIZE = 200
+EXAMPLE_MODEL_URL = (
+    "https://huggingface.co/Nextcloud-AI/sdxl-turbo/resolve/main/"
+    "sd_xl_turbo_1.0_fp16.safetensors"
+)
+EXAMPLE_WORKFLOW = "examples/sdxl_turbo_portrait.json"
 
 
 def _log(msg: str = "") -> None:
-    """Print to stderr (never pollutes JSON stdout)."""
     print(msg, file=sys.stderr)
 
 
 def _prompt(label: str, default: str = "", hidden: bool = False) -> str:
-    """Prompt user for input on stderr, read from stdin."""
-    if default:
+    if hidden and default:
+        prompt_text = f"  {label} [configured]: "
+    elif default:
         prompt_text = f"  {label} [{default}]: "
     else:
         prompt_text = f"  {label}: "
-
+    print(prompt_text, end="", file=sys.stderr, flush=True)
     if hidden:
-        print(prompt_text, end="", file=sys.stderr, flush=True)
         value = getpass.getpass(prompt="")
     else:
-        print(prompt_text, end="", file=sys.stderr, flush=True)
         value = input()
-
     return value.strip() or default
-
-
-def _choose(label: str, options: list[str], valid: list[str]) -> str:
-    """Prompt user to choose from numbered options."""
-    while True:
-        print(f"  {label}: ", end="", file=sys.stderr, flush=True)
-        choice = input().strip()
-        if choice in valid:
-            return choice
-        _log(f"  Invalid choice. Enter one of: {', '.join(valid)}")
 
 
 def _test_storage(s3_config: dict[str, str]) -> None:
@@ -95,12 +62,10 @@ def _test_storage(s3_config: dict[str, str]) -> None:
     try:
         import boto3
         from botocore.config import Config
-    except ImportError:
-        raise RuntimeError(
-            "boto3 is required for S3 storage. Install via: pip install boto3"
-        )
+    except ImportError as e:
+        raise RuntimeError("boto3 is required for S3 storage. Install via: pip install boto3") from e
 
-    client_kwargs = {
+    client_kwargs: dict[str, Any] = {
         "region_name": s3_config.get("s3_region", "eu-west-2"),
         "aws_access_key_id": s3_config["aws_access_key_id"],
         "aws_secret_access_key": s3_config["aws_secret_access_key"],
@@ -115,10 +80,7 @@ def _test_storage(s3_config: dict[str, str]) -> None:
     test_key = "comfy-gen/.storage-test"
     test_data = b"comfy-gen storage test"
 
-    # Upload
     client.put_object(Bucket=bucket, Key=test_key, Body=test_data)
-
-    # Download via pre-signed URL (same path the worker uses)
     url = client.generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": test_key},
@@ -135,138 +97,16 @@ def _test_storage(s3_config: dict[str, str]) -> None:
     if downloaded != test_data:
         raise RuntimeError("Downloaded content does not match uploaded content")
 
-    # Clean up
     client.delete_object(Bucket=bucket, Key=test_key)
 
 
-EXAMPLE_MODEL_URL = (
-    "https://huggingface.co/Nextcloud-AI/sdxl-turbo/resolve/main/"
-    "sd_xl_turbo_1.0_fp16.safetensors"
-)
-EXAMPLE_WORKFLOW = "examples/sdxl_turbo_portrait.json"
-
-
-def _run_example(api_key: str, endpoint_id: str) -> None:
-    """Download an example model and generate a test image."""
-    from comfy_gen import download, serverless
-
-    # Download the model
-    _log("\n  Downloading SDXL Turbo model (~3.5GB)...")
-    _log(f"  comfy-gen download url {EXAMPLE_MODEL_URL} --dest checkpoints\n")
-
-    try:
-        dl_result = download.submit_download(
-            downloads=[{
-                "source": "url",
-                "url": EXAMPLE_MODEL_URL,
-                "dest": "checkpoints",
-            }],
-            timeout=600,
-            endpoint_id=endpoint_id,
-        )
-        if not dl_result.get("ok"):
-            _log(f"  ✗ Download failed: {dl_result.get('error', 'Unknown error')}")
-            return
-        files = dl_result.get("files", [])
-        if files:
-            f = files[0]
-            _log(f"  ✓ Downloaded {f['filename']} ({f['size_mb']:.0f} MB)\n")
-        else:
-            _log("  ✓ Download complete\n")
-    except Exception as e:
-        _log(f"  ✗ Download failed: {e}")
-        return
-
-    # Find the example workflow
-    import pathlib
-
-    # Resolve workflow path relative to the package root
-    pkg_root = pathlib.Path(__file__).resolve().parent.parent
-    workflow_path = pkg_root / EXAMPLE_WORKFLOW
-    if not workflow_path.exists():
-        _log(f"  ✗ Example workflow not found at {workflow_path}")
-        return
-
-    # Submit the workflow
-    _log("  Generating a portrait with SDXL Turbo...")
-    _log(f"  comfy-gen submit {EXAMPLE_WORKFLOW}\n")
-
-    try:
-        result = serverless.submit(
-            workflow_path=str(workflow_path),
-            timeout=300,
-            endpoint_id=endpoint_id,
-        )
-        url = result.get("output", {}).get("url", "")
-        elapsed = result.get("elapsed_seconds", 0)
-        if url:
-            _log(f"  ✓ Image generated in {elapsed}s!")
-            _log(f"  View your image: {url}\n")
-        else:
-            _log(f"  ✓ Generation complete in {elapsed}s (no URL in output)\n")
-    except Exception as e:
-        _log(f"  ✗ Generation failed: {e}")
-
-
-def run(args: argparse.Namespace) -> None:
-    """Run the init wizard."""
-    non_interactive = getattr(args, "non_interactive", False)
-
-    # Check for existing init
-    if config.is_initialized():
-        if non_interactive:
-            output.error("Already initialized. Use --force to re-initialize.")
-        _log("\n  ComfyGen is already initialized.")
-        _log("  Run with --force to re-initialize (creates new resources).\n")
-        if not getattr(args, "force", False):
-            existing = config.load_init()
-            output.success(existing)
-        _log("  Proceeding with re-initialization...\n")
-
-    # ── Banner ──
-    if not non_interactive:
-        _log(BANNER)
-        _log("  Welcome to ComfyGen setup. This will create a RunPod serverless")
-        _log("  endpoint for running ComfyUI workflows.\n")
-
-    # ── Step 1: RunPod API Key ──
-    if not non_interactive:
-        _log("─── Step 1: RunPod API Key ───────────────────────────────────\n")
-
-    api_key = getattr(args, "api_key", None)
-    if not api_key:
-        if non_interactive:
-            output.error("--api-key is required in non-interactive mode.")
-        api_key = _prompt("RunPod API key", hidden=True)
-
-    if not api_key:
-        output.error("No API key provided.")
-
-    _log("  Validating API key...")
-    if not runpod_api.validate_api_key(api_key):
-        output.error("Invalid RunPod API key. Check your key at https://www.runpod.io/console/user/settings")
-
-    if not non_interactive:
-        _log("  ✓ API key valid\n")
-
-    # ── Step 2: Storage ──
-    if not non_interactive:
-        _log("─── Step 2: Storage ──────────────────────────────────────────\n")
-        _log("  ComfyGen needs S3-compatible storage for transferring files")
-        _log("  between your machine and the serverless workers.\n")
-        _log("  Supported providers:")
-        _log("    • AWS S3")
-        _log("    • Cloudflare R2")
-        _log("    • Backblaze B2")
-        _log("    • MinIO / any S3-compatible service\n")
+def _collect_storage_config(args: argparse.Namespace, non_interactive: bool) -> dict[str, str]:
     s3_config: dict[str, str] = {}
-
-    # Check if S3 args were provided in non-interactive mode
     has_s3_args = getattr(args, "s3_access_key", None) and getattr(args, "s3_secret_key", None)
 
     if non_interactive and not has_s3_args:
         output.error("S3 storage is required. Provide --s3-access-key, --s3-secret-key, and --s3-bucket.")
-    elif non_interactive and has_s3_args:
+    if non_interactive and has_s3_args:
         s3_config = {
             "aws_access_key_id": args.s3_access_key,
             "aws_secret_access_key": args.s3_secret_key,
@@ -276,289 +116,205 @@ def run(args: argparse.Namespace) -> None:
         }
         if not s3_config["s3_bucket"]:
             output.error("--s3-bucket is required when configuring S3 storage.")
-    else:
-        while True:
-            _log()
-            _log("  You'll need an API token from your storage provider.")
-            _log("  For Cloudflare R2: Dashboard → R2 → Manage R2 API Tokens\n")
-            s3_config["aws_access_key_id"] = _prompt("Access Key ID")
-            s3_config["aws_secret_access_key"] = _prompt("Secret Access Key", hidden=True)
-            s3_config["s3_bucket"] = _prompt("Bucket name")
-            _log()
-            _log("  For AWS S3, the region is e.g. 'us-east-1' or 'eu-west-2'.")
-            _log("  For Cloudflare R2, enter 'auto'.\n")
-            s3_config["s3_region"] = _prompt("Region", default="auto")
-            _log()
-            _log("  Endpoint URL is required for non-AWS providers:")
-            _log("    Cloudflare R2:  https://<account-id>.r2.cloudflarestorage.com")
-            _log("    Backblaze B2:   https://s3.<region>.backblazeb2.com")
-            _log("    MinIO:          http://your-minio:9000")
-            _log("    AWS S3:         leave empty\n")
-            s3_config["s3_endpoint_url"] = _prompt(
-                "Endpoint URL (empty for AWS S3)", default=""
-            )
-            if not s3_config["aws_access_key_id"] or not s3_config["aws_secret_access_key"]:
-                _log("  ✗ Access key and secret key are required. Try again.\n")
-                continue
-            if not s3_config["s3_bucket"]:
-                _log("  ✗ Bucket name is required. Try again.\n")
-                continue
-
-            # Test the connection
-            _log()
-            _log("  Testing storage connection...")
-            try:
-                _test_storage(s3_config)
-                _log("  ✓ Storage test passed — upload and download verified\n")
-                break
-            except Exception as e:
-                _log(f"\n  ✗ Storage test failed: {e}")
-                _log("  Check your credentials, bucket name, and endpoint URL.")
-                retry = _prompt("Try again? [Y/n]", default="Y")
-                if retry.lower() in ("n", "no"):
-                    output.error(f"Storage test failed: {e}")
-
-    # Verify storage in non-interactive mode (no retry)
-    if non_interactive and s3_config:
-        _log("  Testing storage connection...")
-        try:
-            _test_storage(s3_config)
-            _log("  ✓ Storage test passed\n")
-        except Exception as e:
-            output.error(f"Storage test failed: {e}")
-
-    # ── Step 3: CivitAI Token (optional) ──
-    civitai_token = getattr(args, "civitai_token", None) or ""
-    if not non_interactive:
-        _log("─── Step 3: CivitAI Token (optional) ─────────────────────────\n")
-        _log("  A CivitAI API token lets you download models from CivitAI")
-        _log("  directly to your network volume using 'comfy-gen download'.")
-        _log("  Without it, you can still download from HuggingFace and")
-        _log("  other direct URLs.\n")
-        _log("  Get your token at: https://civitai.com/user/account\n")
-        civitai_token = _prompt("CivitAI API token (press Enter to skip)", hidden=True)
-        if civitai_token:
-            _log("  ✓ CivitAI token saved\n")
-        else:
-            _log("  Skipped. Set later via: comfy-gen config --set civitai_token=...\n")
-
-    # ── Step 4: GPU Tier ──
-    if not non_interactive:
-        _log("─── Step 4: Select GPU Tier ──────────────────────────────────\n")
-        for key, tier in TIERS.items():
-            _log(f"  [{key}] {tier['name']:<14} — {tier['label']}")
-            _log(f"      {tier['region']}")
-        _log()
-
-    tier_choice = getattr(args, "tier", None)
-    if tier_choice:
-        tier_choice = str(tier_choice)
-    if tier_choice not in TIERS:
-        if non_interactive:
-            output.error(f"--tier must be 1, 2, or 3. Got: {tier_choice}")
-        tier_choice = _choose("Select tier [1/2/3]", list(TIERS.keys()), list(TIERS.keys()))
-
-    tier = TIERS[tier_choice]
-    if not non_interactive:
-        _log(f"\n  Selected: {tier['name']} — {tier['label']}\n")
-
-    # ── Step 5: Network Volume ──
-    if not non_interactive:
-        _log("─── Step 5: Network Volume ───────────────────────────────────\n")
-
-    volume_size = getattr(args, "volume_size", None) or DEFAULT_VOLUME_SIZE
-    if not non_interactive:
-        _log("  Models are stored on a persistent network volume attached to your workers.")
-        _log(f"  {DEFAULT_VOLUME_SIZE}GB is recommended — enough for 3-5 different workflows/use cases.")
-        _log("  Choose less to save money. You can resize later in the RunPod dashboard.\n")
-        size_input = _prompt(f"Volume size in GB", default=str(DEFAULT_VOLUME_SIZE))
-        try:
-            volume_size = int(size_input)
-        except ValueError:
-            output.error(f"Invalid volume size: {size_input}")
-        if volume_size < 10:
-            output.error("Minimum volume size is 10GB.")
-
-    _log(f"  Creating {volume_size}GB network volume in {tier['datacenter']}...")
-    try:
-        volume = runpod_api.create_network_volume(
-            api_key,
-            name="comfygen-models",
-            size_gb=volume_size,
-            datacenter_id=tier["datacenter"],
-        )
-    except RuntimeError as e:
-        output.error(f"Failed to create network volume: {e}")
-
-    volume_id = volume["id"]
-    if not non_interactive:
-        _log(f"  ✓ Volume created: {volume_id} ({volume_size}GB, {tier['datacenter']})\n")
-        _log("  Your models go on this volume at /runpod-volume/ComfyUI/models/")
-        _log("  You can resize it later in the RunPod dashboard.\n")
-
-    # ── Step 6: Create Template + Endpoint ──
-    if not non_interactive:
-        _log("─── Step 6: Serverless Endpoint ──────────────────────────────\n")
-
-    # Build env vars for the worker template
-    template_env: dict[str, str] = {
-        "RUNTIME_REPO_URL": runpod_api.RUNTIME_REPO_URL,
-        "RUNTIME_REPO_REF": "main",
-    }
-    if s3_config:
-        template_env["AWS_ACCESS_KEY_ID"] = s3_config["aws_access_key_id"]
-        template_env["AWS_SECRET_ACCESS_KEY"] = s3_config["aws_secret_access_key"]
-        template_env["S3_BUCKET"] = s3_config["s3_bucket"]
-        if s3_config.get("s3_region"):
-            template_env["S3_REGION"] = s3_config["s3_region"]
-        if s3_config.get("s3_endpoint_url"):
-            template_env["S3_ENDPOINT_URL"] = s3_config["s3_endpoint_url"]
-    if civitai_token:
-        template_env["CIVITAI_TOKEN"] = civitai_token
-
-    import uuid
+        return s3_config
 
     while True:
-        _log("  Creating serverless template...")
-        template_name = f"comfygen-{uuid.uuid4().hex[:8]}"
-        try:
-            template = runpod_api.create_template(
-                api_key,
-                name=template_name,
-                env=template_env,
-            )
-        except RuntimeError as e:
-            if non_interactive:
-                output.error(f"Failed to create template: {e}")
-            _log(f"\n  ✗ Failed to create template: {e}")
-            _log("  This can happen if you've hit a RunPod resource limit.")
-            _log("  Fix the issue in your RunPod dashboard, then try again.\n")
-            retry = _prompt("Retry? [Y/n]", default="Y")
-            if retry.lower() in ("n", "no"):
-                output.error(f"Failed to create template: {e}")
+        _log()
+        _log("  You'll need an API token from your storage provider.")
+        _log("  For Cloudflare R2: Dashboard -> R2 -> Manage R2 API Tokens\n")
+        s3_config["aws_access_key_id"] = _prompt("Access Key ID")
+        s3_config["aws_secret_access_key"] = _prompt("Secret Access Key", hidden=True)
+        s3_config["s3_bucket"] = _prompt("Bucket name")
+        _log()
+        _log("  For AWS S3, the region is e.g. 'us-east-1' or 'eu-west-2'.")
+        _log("  For Cloudflare R2, enter 'auto'.\n")
+        s3_config["s3_region"] = _prompt("Region", default="auto")
+        _log()
+        _log("  Endpoint URL is required for non-AWS providers:")
+        _log("    Cloudflare R2:  https://<account-id>.r2.cloudflarestorage.com")
+        _log("    Backblaze B2:   https://s3.<region>.backblazeb2.com")
+        _log("    MinIO:          http://your-minio:9000")
+        _log("    AWS S3:         leave empty\n")
+        s3_config["s3_endpoint_url"] = _prompt("Endpoint URL (empty for AWS S3)", default="")
+
+        if not s3_config["aws_access_key_id"] or not s3_config["aws_secret_access_key"]:
+            _log("  Access key and secret key are required. Try again.\n")
             continue
-
-        template_id = template["id"]
-
-        _log("  Creating serverless endpoint...")
-        try:
-            endpoint = runpod_api.create_endpoint(
-                api_key,
-                name="comfygen",
-                template_id=template_id,
-                gpu_type_ids=tier["gpu_ids"],
-                volume_id=volume_id,
-            )
-        except RuntimeError as e:
-            if non_interactive:
-                output.error(f"Failed to create endpoint: {e}")
-            _log(f"\n  ✗ Failed to create endpoint: {e}")
-            _log("  This can happen if you've hit a RunPod worker or endpoint limit.")
-            _log("  Fix the issue in your RunPod dashboard, then try again.\n")
-            retry = _prompt("Retry? [Y/n]", default="Y")
-            if retry.lower() in ("n", "no"):
-                output.error(f"Failed to create endpoint: {e}")
+        if not s3_config["s3_bucket"]:
+            _log("  Bucket name is required. Try again.\n")
             continue
+        return s3_config
 
-        break
 
-    endpoint_id = endpoint["id"]
-    if not non_interactive:
-        gpu_names = ", ".join(tier["gpu_ids"])
-        _log(f"  ✓ Endpoint created: {endpoint_id}")
-        _log(f"    Template: {template_id}")
-        _log(f"    GPUs: {gpu_names}")
-        _log(f"    Workers: 0 min, 3 max (scale to zero)")
-        _log(f"    FlashBoot: enabled\n")
-
-    # ── Save Config ──
-    cfg = config.load()
-    cfg["runpod_api_key"] = api_key
-    cfg["endpoint_id"] = endpoint_id
+def _secret_env(s3_config: dict[str, str], civitai_token: str = "") -> dict[str, str]:
+    env = {
+        "AWS_ACCESS_KEY_ID": s3_config["aws_access_key_id"],
+        "AWS_SECRET_ACCESS_KEY": s3_config["aws_secret_access_key"],
+        "S3_BUCKET": s3_config["s3_bucket"],
+        "S3_REGION": s3_config.get("s3_region", "eu-west-2"),
+    }
+    if s3_config.get("s3_endpoint_url"):
+        env["S3_ENDPOINT_URL"] = s3_config["s3_endpoint_url"]
     if civitai_token:
-        cfg["civitai_token"] = civitai_token
-    if s3_config:
-        cfg.update(s3_config)
+        env["CIVITAI_TOKEN"] = civitai_token
+    return env
+
+
+def _run_example(app_name: str) -> None:
+    from comfy_gen import download, serverless
+
+    _log("\n  Downloading SDXL Turbo model (~3.5GB)...")
+    _log(f"  comfy-gen download url {EXAMPLE_MODEL_URL} --dest checkpoints\n")
+    try:
+        dl_result = download.submit_download(
+            downloads=[{"source": "url", "url": EXAMPLE_MODEL_URL, "dest": "checkpoints"}],
+            timeout=900,
+            app_name=app_name,
+        )
+        if not dl_result.get("ok"):
+            _log(f"  Download failed: {dl_result.get('error', 'Unknown error')}")
+            return
+    except Exception as e:
+        _log(f"  Download failed: {e}")
+        return
+
+    import pathlib
+
+    pkg_root = pathlib.Path(__file__).resolve().parent.parent
+    workflow_path = pkg_root / EXAMPLE_WORKFLOW
+    if not workflow_path.exists():
+        _log(f"  Example workflow not found at {workflow_path}")
+        return
+
+    _log("  Generating a portrait with SDXL Turbo...")
+    _log(f"  comfy-gen submit {EXAMPLE_WORKFLOW}\n")
+    try:
+        result = serverless.submit(
+            workflow_path=str(workflow_path),
+            timeout=300,
+            app_name=app_name,
+        )
+        url = result.get("output", {}).get("url", "")
+        elapsed = result.get("elapsed_seconds", 0)
+        if url:
+            _log(f"  Image generated in {elapsed}s!")
+            _log(f"  View your image: {url}\n")
+        else:
+            _log(f"  Generation complete in {elapsed}s (no URL in output)\n")
+    except Exception as e:
+        _log(f"  Generation failed: {e}")
+
+
+def run(args: argparse.Namespace) -> None:
+    """Run the init wizard."""
+    non_interactive = getattr(args, "non_interactive", False)
+
+    if config.is_initialized() and not getattr(args, "force", False):
+        if non_interactive:
+            output.error("Already initialized. Use --force to re-initialize.")
+        _log("\n  ComfyGen is already initialized.")
+        _log("  Run with --force to re-initialize.\n")
+        output.success(config.load_init())
+
+    if not non_interactive:
+        _log(BANNER)
+        _log("  Welcome to ComfyGen setup. This will deploy a Modal H100 worker")
+        _log("  and create a Modal Volume for ComfyUI models and custom nodes.\n")
+
+    cfg = config.load()
+    app_name = getattr(args, "app_name", None) or cfg.get("modal_app_name", DEFAULT_APP_NAME)
+    volume_name = getattr(args, "volume_name", None) or cfg.get("modal_volume_name", DEFAULT_VOLUME_NAME)
+    secret_name = getattr(args, "secret_name", None) or cfg.get("modal_secret_name", DEFAULT_SECRET_NAME)
+    jobs_name = getattr(args, "jobs_name", None) or cfg.get("modal_jobs_name", DEFAULT_JOBS_NAME)
+
+    if not non_interactive:
+        _log("─── Step 1: Modal Resources ──────────────────────────────────\n")
+        _log("  Modal authentication must already be configured.")
+        _log("  If needed, run: modal setup\n")
+        app_name = _prompt("Modal app name", default=app_name)
+        volume_name = _prompt("Modal Volume name", default=volume_name)
+        secret_name = _prompt("Modal Secret name", default=secret_name)
+        jobs_name = _prompt("Modal job state Dict name", default=jobs_name)
+
+    if not non_interactive:
+        _log("\n─── Step 2: Storage ──────────────────────────────────────────\n")
+        _log("  ComfyGen needs S3-compatible storage for inputs and outputs.\n")
+
+    s3_config = _collect_storage_config(args, non_interactive)
+
+    _log("  Testing storage connection...")
+    try:
+        _test_storage(s3_config)
+        _log("  Storage test passed\n")
+    except Exception as e:
+        output.error(f"Storage test failed: {e}")
+
+    civitai_token = getattr(args, "civitai_token", None) or cfg.get("civitai_token", "")
+    if not non_interactive:
+        _log("─── Step 3: CivitAI Token (optional) ─────────────────────────\n")
+        _log("  A CivitAI API token lets workers download models from CivitAI.")
+        _log("  Get your token at: https://civitai.com/user/account\n")
+        if civitai_token:
+            _log("  Existing token configured. Press Enter to keep it.\n")
+        civitai_token = _prompt("CivitAI API token", default=civitai_token, hidden=True)
+
+    if not non_interactive:
+        _log("─── Step 4: Deploy Modal App ─────────────────────────────────\n")
+    _log(f"  Creating/hydrating Modal Volume: {volume_name}")
+    _log(f"  Creating/hydrating Modal job state Dict: {jobs_name}")
+    try:
+        modal_client.ensure_modal_objects(volume_name, jobs_name)
+    except Exception as e:
+        output.error(
+            "Modal authentication failed. Run 'modal setup' or configure "
+            f"MODAL_TOKEN_ID/MODAL_TOKEN_SECRET, then retry. Details: {e}"
+        )
+
+    _log(f"  Creating/updating Modal Secret: {secret_name}")
+    try:
+        modal_client.create_or_update_secret(secret_name, _secret_env(s3_config, civitai_token))
+    except Exception as e:
+        output.error(f"Failed to create/update Modal Secret: {e}")
+
+    _log(f"  Deploying Modal app '{app_name}' on {DEFAULT_GPU}...")
+    try:
+        modal_client.deploy_app(app_name, volume_name, secret_name, jobs_name)
+    except Exception as e:
+        output.error(f"Failed to deploy Modal app: {e}")
+
+    cfg["modal_app_name"] = app_name
+    cfg["modal_volume_name"] = volume_name
+    cfg["modal_secret_name"] = secret_name
+    cfg["modal_jobs_name"] = jobs_name
+    cfg["modal_function_name"] = "run_job"
+    cfg["civitai_token"] = civitai_token
+    cfg.update(s3_config)
     config.save(cfg)
 
-    # ── Save Init Marker ──
     init_data = {
         "initialized_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "endpoint_id": endpoint_id,
-        "template_id": template_id,
-        "volume_id": volume_id,
-        "datacenter": tier["datacenter"],
-        "tier": tier["name"],
-        "gpu_types": tier["gpu_ids"],
+        "provider": "modal",
+        "app_name": app_name,
+        "function_name": "run_job",
+        "volume_name": volume_name,
+        "secret_name": secret_name,
+        "jobs_name": jobs_name,
+        "gpu_type": DEFAULT_GPU,
     }
     config.save_init(init_data)
 
     if not non_interactive:
-        _log("  ✓ Config saved to ~/.comfy-gen/config.json\n")
-
-    # ── Step 7: Wait for endpoint readiness ──
-    if not non_interactive:
-        _log("─── Step 7: Waiting for Endpoint ──────────────────────────────\n")
-    _log("  Workers are downloading the Docker image (this takes 15-20 min)...")
-    _log("  You can Ctrl+C to skip — the endpoint will finish initializing in the background.\n")
-    ready = False
-    poll_interval = 15
-    max_wait = 1800  # 30 minutes
-    elapsed = 0
-    last_msg = ""
-
-    try:
-        while elapsed < max_wait:
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-            try:
-                health = runpod_api.get_endpoint_health(api_key, endpoint_id)
-                workers = health.get("workers", {})
-                initializing = workers.get("initializing", 0)
-                w_ready = workers.get("ready", 0)
-                idle = workers.get("idle", 0)
-
-                if w_ready > 0 or idle > 0:
-                    ready = True
-                    break
-
-                mins = elapsed // 60
-                secs = elapsed % 60
-                msg = f"  [{mins}m{secs:02d}s] {initializing} worker(s) initializing..."
-                if msg != last_msg:
-                    _log(msg)
-                    last_msg = msg
-            except Exception:
-                if elapsed % 60 == 0:
-                    _log(f"  [{elapsed // 60}m] Waiting for health endpoint...")
-    except KeyboardInterrupt:
-        _log("\n  Skipped. The endpoint will continue initializing in the background.")
-        _log(f"  Monitor at: https://www.runpod.io/console/serverless/{endpoint_id}\n")
-
-    if ready:
-        mins = elapsed // 60
-        secs = elapsed % 60
-        _log(f"  ✓ Endpoint is ready! ({mins}m{secs:02d}s)\n")
-    elif elapsed >= max_wait:
-        _log(f"  ⚠ Workers still initializing after {elapsed // 60}m.")
-        _log("  This is normal for first-time setup. Monitor progress at:")
-        _log(f"  https://www.runpod.io/console/serverless/{endpoint_id}\n")
-
-    # ── Step 8: Example Generation (optional) ──
-    if not non_interactive and ready:
-        _log("─── Step 8: Try It Out ───────────────────────────────────────\n")
+        _log("\n  Config saved to ~/.comfy-gen/config.json\n")
+        _log("─── Step 5: Try It Out ───────────────────────────────────────\n")
         _log("  Want to test your setup with a quick image generation?")
         _log("  This will download a small model (~3.5GB) and generate a portrait.\n")
         try_example = _prompt("Run example? [Y/n]", default="Y")
-
         if try_example.lower() not in ("n", "no"):
-            _run_example(api_key, endpoint_id)
+            _run_example(app_name)
 
-    # ── Summary ──
-    if not non_interactive:
         _log("─── Setup Complete ───────────────────────────────────────────\n")
         _log("  Next steps:")
-        _log("    1. Download models to your network volume:")
+        _log("    1. Download models to your Modal Volume:")
         _log("       comfy-gen download url <huggingface-url> --dest checkpoints")
         _log("    2. Run a workflow:")
         _log("       comfy-gen submit workflow.json\n")

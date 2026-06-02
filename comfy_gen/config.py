@@ -10,8 +10,11 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 INIT_FILE = CONFIG_DIR / "init.json"
 
 DEFAULTS: dict[str, Any] = {
-    "runpod_api_key": "",
-    "endpoint_id": "",
+    "modal_app_name": "comfy-gen",
+    "modal_volume_name": "comfy-gen-comfyui",
+    "modal_secret_name": "comfy-gen-storage",
+    "modal_jobs_name": "comfy-gen-jobs",
+    "modal_function_name": "run_job",
     # Storage (S3-compatible)
     "aws_access_key_id": "",
     "aws_secret_access_key": "",
@@ -19,14 +22,17 @@ DEFAULTS: dict[str, Any] = {
     "s3_bucket": "",
     "s3_endpoint_url": "",
     "civitai_token": "",
-    "timeout_seconds": 600,
+    "timeout_seconds": 1200,
     "poll_interval_seconds": 3,
 }
 
 # Mapping: env var name -> config key
 ENV_MAP = {
-    "RUNPOD_API_KEY": "runpod_api_key",
-    "RUNPOD_ENDPOINT_ID": "endpoint_id",
+    "COMFY_GEN_MODAL_APP_NAME": "modal_app_name",
+    "COMFY_GEN_MODAL_VOLUME_NAME": "modal_volume_name",
+    "COMFY_GEN_MODAL_SECRET_NAME": "modal_secret_name",
+    "COMFY_GEN_MODAL_JOBS_NAME": "modal_jobs_name",
+    "COMFY_GEN_MODAL_FUNCTION_NAME": "modal_function_name",
     "AWS_ACCESS_KEY_ID": "aws_access_key_id",
     "AWS_SECRET_ACCESS_KEY": "aws_secret_access_key",
     "S3_REGION": "s3_region",

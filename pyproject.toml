@@ -4,12 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfy-gen"
-version = "0.2.0"
-description = "Agent-first CLI for executing ComfyUI workflows on RunPod serverless"
+version = "0.3.0"
+description = "Agent-first CLI for executing ComfyUI workflows on Modal H100 workers"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
-keywords = ["comfyui", "runpod", "serverless", "image-generation", "cli"]
+keywords = ["comfyui", "modal", "serverless", "image-generation", "cli"]
+dependencies = [
+    "boto3>=1.34.0",
+    "modal>=1.2.6",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

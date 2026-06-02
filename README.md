@@ -1,86 +1,49 @@
 # comfy-gen
 
-**An agentic CLI for running ComfyUI workflows on RunPod serverless.** Designed to be used by AI coding agents (Claude Code, Cursor, Codex, Windsurf, Gemini CLI) as much as by humans. All output is structured JSON. No interactive prompts. Every command has verbose `--help` so agents can discover capabilities without documentation.
-
-## Table of Contents
-
-- [Use with Your Favorite AI Agent](#use-with-your-favorite-ai-agent)
-- [How It Works](#how-it-works)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Commands](#commands)
-  - [submit](#comfy-gen-submit-workflowjson)
-  - [status](#comfy-gen-status-job-id)
-  - [cancel](#comfy-gen-cancel-job-id)
-  - [download](#comfy-gen-download-civitaiurl-target)
-  - [config](#comfy-gen-config)
-- [Getting Models onto Your Volume](#getting-models-onto-your-volume)
-- [Configuration](#configuration)
-- [Storage](#storage)
-- [Workflow Format](#workflow-format)
-- [Output Format](#output-format)
-- [Prerequisites](#prerequisites)
-
-## Use with Your Favorite AI Agent
-
-ComfyGen ships with an **agent skill file** at `SKILL.md` in the repo root. Drop it into your agent's skill/tool directory and it can submit workflows, download models, check job status, and manage your RunPod infrastructure — all through natural language.
-
-```
-You: "Submit this workflow with seed 42 and download the output"
-Agent: runs comfy-gen submit workflow.json --override 7.seed=42, parses JSON, fetches URL
-```
-
-Works with any agent that can run shell commands and parse JSON. The skill file teaches your agent the full API surface, including workflow analysis, parameter overrides, and error handling.
+**An agentic CLI for running ComfyUI workflows on Modal H100 workers.** It is designed for AI coding agents and humans: every command emits structured JSON on stdout, progress goes to stderr, and all commands are discoverable with `--help`.
 
 ## How It Works
 
-```
+```bash
 comfy-gen submit workflow.json
 ```
 
-1. Detects local file references in your workflow and uploads them to S3
-2. Submits the workflow to your RunPod serverless endpoint
-3. Polls for completion with real-time progress
-4. Returns a JSON result with output URLs
+1. Detects local `LoadImage` file paths and uploads them to S3-compatible storage.
+2. Spawns the deployed Modal `run_job` function on `H100!` GPU hardware.
+3. Mounts a Modal Volume at `/runpod-volume` for compatibility with the existing ComfyUI handler.
+4. Stores ComfyUI models at `/runpod-volume/ComfyUI/models` and custom nodes at `/runpod-volume/ComfyUI/custom_nodes`.
+5. Automatically resolves and installs missing custom nodes through ComfyUI-Manager.
+6. Automatically downloads Manager-known missing models to the Modal Volume before queuing the workflow.
+7. Polls Modal job state and returns output URLs as JSON.
 
-Workers spin up on demand, execute the workflow, and shut down. You pay only for execution time.
+Outputs still use S3-compatible storage so results can be accessed from your local machine, scripts, and downstream tools.
 
 ## Installation
 
-Requires Python 3.11+.
-
-### Recommended: pipx (installs system-wide, no venv needed)
-
-```bash
-brew install pipx        # macOS — or: apt install pipx / pip install pipx
-pipx ensurepath          # adds pipx bin dir to PATH (restart your shell after)
-
-git clone https://github.com/Hearmeman24/ComfyGen.git
-cd ComfyGen
-pipx install --editable .
-pipx inject comfy-gen boto3
-```
-
-### Alternative: pip
+Requires Python 3.11+ and Modal authentication.
 
 ```bash
 git clone https://github.com/Hearmeman24/ComfyGen.git
 cd ComfyGen
 pip install -e .
-pip install boto3
+modal setup
 ```
 
-After installation, `comfy-gen` is available system-wide as a CLI command.
+For isolated CLI installs:
 
-> **Windows users:** Make sure "Add Python to PATH" was checked during Python installation, or `comfy-gen` won't be found. If you missed it, add Python's `Scripts` directory to your PATH manually (e.g. `C:\Users\<you>\AppData\Local\Programs\Python\Python3xx\Scripts`).
+```bash
+pipx install --editable .
+pipx inject comfy-gen modal boto3
+modal setup
+```
 
 ## Quick Start
 
 ```bash
-# 1. Run the setup wizard (creates RunPod endpoint + configures storage)
+# 1. Deploy the Modal app, create the Modal Volume, and configure storage
 comfy-gen init
 
-# 2. Download models to your network volume
+# 2. Optionally download known models to the Modal Volume
 comfy-gen download civitai 456789 --dest loras
 comfy-gen download url https://huggingface.co/org/repo/resolve/main/model.safetensors --dest checkpoints
 
@@ -94,36 +57,47 @@ comfy-gen submit workflow.json --input 193=/path/to/photo.jpg
 comfy-gen submit workflow.json --override 7.seed=42 --override 7.denoise=0.8
 
 # 6. Check job status / cancel
-comfy-gen status <job-id>
-comfy-gen cancel <job-id>
+comfy-gen status <modal-function-call-id>
+comfy-gen cancel <modal-function-call-id>
 ```
 
 ## Commands
 
+### `comfy-gen init`
+
+Deploys the Modal app and creates the required Modal resources:
+
+- Modal app: `comfy-gen`
+- Modal function: `run_job`
+- Modal Volume: `comfy-gen-comfyui`
+- Modal Dict for job progress: `comfy-gen-jobs`
+- Modal Secret for S3/CivitAI credentials: `comfy-gen-storage`
+
+Non-interactive example:
+
+```bash
+comfy-gen init --non-interactive --app-name comfy-gen \
+  --s3-access-key AKIA... \
+  --s3-secret-key ... \
+  --s3-bucket my-bucket \
+  --s3-region us-east-1
+```
+
+For R2, B2, MinIO, or DigitalOcean Spaces, include `--s3-endpoint-url`.
+
 ### `comfy-gen submit <workflow.json>`
 
-Full pipeline: upload inputs, submit to serverless, poll, return output URLs.
+Submits a ComfyUI API-format workflow to Modal and waits for completion.
 
 ```bash
 comfy-gen submit workflow.json
 comfy-gen submit workflow.json --input 193=/path/to/ref.jpg
 comfy-gen submit workflow.json --override 7.seed=42
-comfy-gen submit workflow.json --timeout 300
+comfy-gen submit workflow.json --timeout 1200
 ```
 
-**Progress (stderr):**
-```
-Submitting to RunPod serverless endpoint...
-Job submitted: abc-123-def
-[3s]  IN_QUEUE
-[6s]  node_check: Checking custom nodes (10%)
-[9s]  inference: (2/8) Step 1/8 (29%)
-[12s] inference: (5/8) Step 4/8 (55%)
-[15s] upload: Uploading outputs to S3 (92%)
-Completed in 27s (+2s queue). 1 image
-```
+Result:
 
-**Result (stdout):**
 ```json
 {
   "ok": true,
@@ -132,57 +106,45 @@ Completed in 27s (+2s queue). 1 image
     "seed": 1027836870258818,
     "resolution": {"width": 828, "height": 1248},
     "model_hashes": {
-      "model.safetensors": {"sha256": "240761...", "type": "diffusion_models"},
-      "lora.safetensors": {"sha256": "2fdc9d...", "type": "loras", "strength": 0.8}
+      "model.safetensors": {"sha256": "240761...", "type": "diffusion_models"}
     }
   },
-  "job_id": "abc-123-def",
-  "delay_seconds": 2,
+  "job_id": "fc-...",
   "elapsed_seconds": 27
 }
 ```
 
-**Features:**
-- Auto-detects `LoadImage` nodes referencing local files and uploads them to S3
-- `--input NODE_ID=FILE_PATH` for explicit file mapping (videos, etc.) — repeatable
-- `--override NODE_ID.PARAM=VALUE` for parameter overrides — repeatable, auto-coerces numbers
-- Real-time progress with stage, step count, and percentage
-- Output metadata stripped (no embedded workflow data in images)
-- Returns model hashes (SHA256), types, and LoRA strengths
-
 ### `comfy-gen status <job-id>`
 
-Check the status of a submitted job.
+Checks a Modal FunctionCall by ID and returns the latest progress or final result.
 
-```json
-{"job_id": "abc-123", "status": "completed", "ok": true, "output": {"url": "..."}, "elapsed_seconds": 27, "delay_seconds": 2}
+```bash
+comfy-gen status fc-...
 ```
 
 ### `comfy-gen cancel <job-id>`
 
-Cancel a running or queued job.
+Cancels a running or queued Modal FunctionCall.
+
+```bash
+comfy-gen cancel fc-...
+```
 
 ### `comfy-gen download <civitai|url> <target>`
 
-Download models to your RunPod network volume via a serverless job. Files land directly on the mounted volume at `/runpod-volume/ComfyUI/models/<dest>/`.
+Downloads model files directly to the Modal Volume at `/runpod-volume/ComfyUI/models/<dest>/`.
 
 ```bash
-# Download a LoRA from CivitAI (use model VERSION ID, not model ID)
 comfy-gen download civitai 456789 --dest loras
-
-# Download a checkpoint from HuggingFace
 comfy-gen download url https://huggingface.co/Comfy-Org/flux1-dev/resolve/main/flux1-dev-fp8.safetensors --dest checkpoints
-
-# Download with a custom filename
 comfy-gen download url https://example.com/model.safetensors --dest diffusion_models --filename my_model.safetensors
-
-# Batch download from a JSON file
 comfy-gen download --batch models.json
 ```
 
-**Supported `--dest` values:** `checkpoints`, `loras`, `vae`, `clip`, `diffusion_models`, `text_encoders`, `controlnet`, `upscale_models`
+Supported `--dest` values include `checkpoints`, `loras`, `vae`, `clip`, `diffusion_models`, `text_encoders`, `controlnet`, and `upscale_models`.
 
-**Batch file format:**
+Batch file format:
+
 ```json
 [
   {"source": "civitai", "version_id": "456789", "dest": "loras"},
@@ -190,115 +152,64 @@ comfy-gen download --batch models.json
 ]
 ```
 
-**Result:**
-```json
-{
-  "ok": true,
-  "files": [
-    {"filename": "model.safetensors", "dest": "loras", "path": "/runpod-volume/ComfyUI/models/loras/model.safetensors", "size_mb": 228.5}
-  ],
-  "job_id": "abc-123-def",
-  "elapsed_seconds": 45
-}
-```
-
 ### `comfy-gen list [model_type]`
 
-List model files installed on the RunPod network volume. Submits a lightweight job to a worker which scans the filesystem.
+Lists model files on the Modal Volume.
 
 ```bash
-comfy-gen list loras              # List LoRAs (default)
-comfy-gen list checkpoints        # List checkpoints
-comfy-gen list diffusion_models   # List diffusion models
+comfy-gen list loras
+comfy-gen list checkpoints
+comfy-gen list diffusion_models
 ```
 
-**Result:**
-```json
-{
-  "ok": true,
-  "model_type": "loras",
-  "files": [
-    {"filename": "my_lora.safetensors", "path": "/runpod-volume/ComfyUI/models/loras/my_lora.safetensors", "size_mb": 228.5}
-  ],
-  "search_paths": ["/ComfyUI/models/loras", "/runpod-volume/ComfyUI/models/loras"],
-  "job_id": "abc-123-def"
-}
-```
+### `comfy-gen info`
 
-## Getting Models onto Your Volume
-
-There are two ways to populate your RunPod network volume with models:
-
-### Option 1: `comfy-gen download` (individual models)
-
-Download specific models from CivitAI or HuggingFace directly to your volume. Best for adding individual LoRAs, checkpoints, or other files on demand. See the [download command](#comfy-gen-download-civitaiurl-target) above.
-
-### Option 2: Pre-populated RunPod Templates (full model sets)
-
-For common workflows, deploy a [HearmemanAI RunPod template](https://get.runpod.io/wan-template) that comes pre-configured to download entire model sets to your network volume on first boot.
-
-For example, to get all models needed for **Wan 2.2 + Wan Animate** video generation:
-
-1. Deploy the [Wan template](https://get.runpod.io/wan-template) as a **GPU pod** attached to your network volume
-2. Set these environment variables on the pod:
-   - `download_wan22=true`
-   - `download_wan_animate=true`
-3. Wait for the pod to fully deploy — all Wan 2.2 and Wan Animate models will be downloaded to the volume
-4. Stop and delete the pod — the models persist on your network volume
-5. Your serverless endpoint (which mounts the same volume) can now run Wan workflows
-
-This is the fastest way to get started with a specific workflow type. You only need to deploy the template once per model set.
-
----
-
-### `comfy-gen config`
-
-Manage persistent configuration stored at `~/.comfy-gen/config.json`.
+Queries the remote ComfyUI worker for dynamic options such as samplers, schedulers, and installed LoRAs.
 
 ```bash
-comfy-gen config                                     # Show all config
-comfy-gen config --set runpod_api_key=rpa_abc123     # Set a value
-comfy-gen config --get endpoint_id                   # Get a single value
+comfy-gen info
 ```
 
 ## Configuration
 
-Config is read from multiple sources with this priority order:
+Config is read from:
 
 **config.json > .env file > environment variables > defaults**
 
 | Key | Description | Env Var | Default |
 |-----|-------------|---------|---------|
-| `runpod_api_key` | RunPod API key | `RUNPOD_API_KEY` | — |
-| `endpoint_id` | RunPod serverless endpoint ID | `RUNPOD_ENDPOINT_ID` | — |
-| `aws_access_key_id` | S3 access key | `AWS_ACCESS_KEY_ID` | — |
-| `aws_secret_access_key` | S3 secret key | `AWS_SECRET_ACCESS_KEY` | — |
-| `s3_bucket` | S3 bucket name | `S3_BUCKET` | — |
+| `modal_app_name` | Modal app name | `COMFY_GEN_MODAL_APP_NAME` | `comfy-gen` |
+| `modal_volume_name` | Modal Volume for models/custom nodes | `COMFY_GEN_MODAL_VOLUME_NAME` | `comfy-gen-comfyui` |
+| `modal_secret_name` | Modal Secret for S3/CivitAI credentials | `COMFY_GEN_MODAL_SECRET_NAME` | `comfy-gen-storage` |
+| `modal_jobs_name` | Modal Dict for job progress | `COMFY_GEN_MODAL_JOBS_NAME` | `comfy-gen-jobs` |
+| `aws_access_key_id` | S3 access key | `AWS_ACCESS_KEY_ID` | - |
+| `aws_secret_access_key` | S3 secret key | `AWS_SECRET_ACCESS_KEY` | - |
+| `s3_bucket` | S3 bucket name | `S3_BUCKET` | - |
 | `s3_region` | S3 region | `S3_REGION` | `eu-west-2` |
-| `s3_endpoint_url` | Custom S3 endpoint (for R2/B2/MinIO) | `S3_ENDPOINT_URL` | — |
-| `civitai_token` | CivitAI API token for model downloads | `CIVITAI_TOKEN` | — |
-| `timeout_seconds` | Max wait for completion | `COMFY_GEN_TIMEOUT` | `600` |
+| `s3_endpoint_url` | Custom S3 endpoint | `S3_ENDPOINT_URL` | - |
+| `civitai_token` | CivitAI API token | `CIVITAI_TOKEN` | - |
+| `timeout_seconds` | Max wait for workflow completion | `COMFY_GEN_TIMEOUT` | `1200` |
 | `poll_interval_seconds` | Status poll interval | `COMFY_GEN_POLL_INTERVAL` | `3` |
 
-You can also put these in a `.env` file in your project directory.
+Modal authentication is handled by the Modal SDK via `modal setup` or `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`.
 
 ## Storage
 
-ComfyGen requires **S3-compatible storage** for transferring input files (images, videos) to workers and receiving output files. The setup wizard (`comfy-gen init`) configures storage and verifies it works before creating your endpoint.
+ComfyGen requires S3-compatible storage for local input uploads and worker output uploads.
 
 | Service | Config |
 |---------|--------|
-| **AWS S3** | Set `aws_access_key_id`, `aws_secret_access_key`, `s3_bucket`, `s3_region` |
-| **Cloudflare R2** | Same as above + `s3_endpoint_url=https://<account-id>.r2.cloudflarestorage.com`, `s3_region=auto` |
-| **Backblaze B2** | Same as above + `s3_endpoint_url=https://s3.<region>.backblazeb2.com` |
-| **MinIO** | Same as above + `s3_endpoint_url=http://your-minio:9000` |
-| **DigitalOcean Spaces** | Same as above + `s3_endpoint_url=https://<region>.digitaloceanspaces.com` |
+| AWS S3 | `aws_access_key_id`, `aws_secret_access_key`, `s3_bucket`, `s3_region` |
+| Cloudflare R2 | Same as above plus `s3_endpoint_url=https://<account-id>.r2.cloudflarestorage.com`, `s3_region=auto` |
+| Backblaze B2 | Same as above plus `s3_endpoint_url=https://s3.<region>.backblazeb2.com` |
+| MinIO | Same as above plus `s3_endpoint_url=http://your-minio:9000` |
+| DigitalOcean Spaces | Same as above plus `s3_endpoint_url=https://<region>.digitaloceanspaces.com` |
 
-Uploads are content-addressed (MD5 hash key) — identical files are never re-uploaded.
+Uploads are content-addressed, so identical input files are not re-uploaded.
 
 ## Workflow Format
 
-Workflows must be in **ComfyUI API format** — the node-ID-keyed JSON with `class_type` and `inputs` fields. Export from ComfyUI via **Save (API Format)** or enable Dev Mode first.
+Workflows must be in ComfyUI API format: node-ID-keyed JSON with `class_type` and `inputs` fields. Export from ComfyUI using Save (API Format), or enable Dev Mode first.
 
 ```json
 {
@@ -315,32 +226,20 @@ Workflows must be in **ComfyUI API format** — the node-ID-keyed JSON with `cla
 
 ## Output Format
 
-All commands output JSON to **stdout**. Human-readable progress goes to **stderr**. This makes comfy-gen composable with `jq`, shell scripts, and AI agents.
+All commands output JSON to stdout. Progress and logs go to stderr.
 
 ```bash
-# Extract just the output URL
 comfy-gen submit workflow.json 2>/dev/null | jq -r '.output.url'
-
-# Save output URL to a variable
-URL=$(comfy-gen submit workflow.json 2>/dev/null | jq -r '.output.url')
 ```
 
-**Success** exits with code `0`:
-```json
-{"ok": true, "output": {"url": "...", "seed": 42, "resolution": {"width": 1024, "height": 1024}}, "job_id": "...", "elapsed_seconds": 30}
-```
-
-**Error** exits with code `1`:
-```json
-{"status": "error", "error": "No RunPod API key configured. Set via: comfy-gen config --set runpod_api_key=rpa_..."}
-```
+Success exits with code `0`; errors exit with code `1`.
 
 ## Prerequisites
 
-You need:
-1. A **RunPod account** — `comfy-gen init` creates the serverless endpoint for you
-2. **S3-compatible storage** — AWS S3, Cloudflare R2, Backblaze B2, or any S3-compatible service (see [Storage](#storage))
-3. **Python 3.11+** and `boto3` (`pipx inject comfy-gen boto3` or `pip install boto3`)
+1. A Modal account and local Modal authentication (`modal setup`).
+2. S3-compatible storage for input and output transfer.
+3. Python 3.11+.
+4. Optional: CivitAI API token for CivitAI downloads.
 
 ## License
 
