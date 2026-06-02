@@ -9,12 +9,14 @@ comfy-gen submit workflow.json
 ```
 
 1. Detects local `LoadImage` file paths and uploads them to S3-compatible storage.
-2. Spawns the deployed Modal `run_job` function on `H100!` GPU hardware.
-3. Mounts a Modal Volume at `/runpod-volume` for compatibility with the existing ComfyUI handler.
-4. Stores ComfyUI models at `/runpod-volume/ComfyUI/models` and custom nodes at `/runpod-volume/ComfyUI/custom_nodes`.
-5. Automatically resolves and installs missing custom nodes through ComfyUI-Manager.
-6. Automatically downloads Manager-known missing models to the Modal Volume before queuing the workflow.
-7. Polls Modal job state and returns output URLs as JSON.
+2. Detects whether the workflow is ComfyUI API format or UI format.
+3. Spawns the deployed Modal `run_job` function on `H100!` GPU hardware.
+4. For UI-format workflows, starts headless ComfyUI and converts the workflow using the live `object_info` schema.
+5. Mounts a Modal Volume at `/runpod-volume` for compatibility with the existing ComfyUI handler.
+6. Stores ComfyUI models at `/runpod-volume/ComfyUI/models` and custom nodes at `/runpod-volume/ComfyUI/custom_nodes`.
+7. Automatically resolves and installs missing custom nodes through ComfyUI-Manager.
+8. Automatically downloads Manager-known missing models to the Modal Volume before queuing the workflow.
+9. Polls Modal job state and returns output URLs as JSON.
 
 Outputs still use S3-compatible storage so results can be accessed from your local machine, scripts, and downstream tools.
 
@@ -96,7 +98,7 @@ For R2, B2, MinIO, or DigitalOcean Spaces, include `--s3-endpoint-url`.
 
 ### `comfy-gen submit <workflow.json>`
 
-Submits a ComfyUI API-format workflow to Modal and waits for completion.
+Submits a ComfyUI workflow to Modal and waits for completion. API-format workflows run directly. UI-format workflows are converted inside the Modal worker after headless ComfyUI starts, using the worker's installed nodes and live `object_info` schema.
 
 ```bash
 comfy-gen submit workflow.json
@@ -218,7 +220,12 @@ Uploads are content-addressed, so identical input files are not re-uploaded.
 
 ## Workflow Format
 
-Workflows must be in ComfyUI API format: node-ID-keyed JSON with `class_type` and `inputs` fields. Export from ComfyUI using Save (API Format), or enable Dev Mode first.
+ComfyGen accepts both common ComfyUI JSON formats:
+
+- API format: node-ID-keyed JSON with `class_type` and `inputs` fields.
+- UI format: JSON with top-level `nodes` and `links`, as saved from the normal ComfyUI UI.
+
+API-format workflows run directly. UI-format workflows are converted on Modal after a headless ComfyUI instance starts. If the UI workflow references custom nodes that are not installed yet, ComfyGen first asks ComfyUI-Manager to install them, then re-queries `object_info` and performs the conversion.
 
 ```json
 {

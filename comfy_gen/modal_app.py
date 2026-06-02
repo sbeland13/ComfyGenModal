@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import os
 import re
@@ -286,6 +287,11 @@ def _patch_download_timeouts(download_handler) -> None:
     if getattr(download_handler, "_MODAL_TIMEOUT_PATCHED", False):
         return
 
+    params = inspect.signature(download_handler._download_url).parameters
+    if "timeout_sec" in params:
+        download_handler._MODAL_TIMEOUT_PATCHED = True
+        return
+
     parse_progress = download_handler._parse_aria2c_progress
 
     def _send_download_progress(job: dict | None, message: str, percent: float) -> None:
@@ -306,6 +312,7 @@ def _patch_download_timeouts(download_handler) -> None:
         job: dict | None = None,
         item_index: int = 0,
         total_items: int = 1,
+        **_kwargs,
     ) -> dict:
         os.makedirs(dest_dir, exist_ok=True)
         if not filename:
@@ -362,7 +369,7 @@ def _patch_download_timeouts(download_handler) -> None:
         size_mb = round(os.path.getsize(filepath) / (1024 * 1024), 1)
         return {"filename": filename, "path": filepath, "size_mb": size_mb}
 
-    def _download_civitai(version_id: str, dest_dir: str) -> dict:
+    def _download_civitai(version_id: str, dest_dir: str, **_kwargs) -> dict:
         os.makedirs(dest_dir, exist_ok=True)
         before = set(os.listdir(dest_dir)) if os.path.isdir(dest_dir) else set()
         result = subprocess.run(
@@ -417,14 +424,20 @@ def _patch_handler_modules(worker, node_installer, download_handler) -> None:
     original_check_models = worker._check_models_exist
     original_ensure_nodes = node_installer.ensure_nodes
 
-    def _check_models_exist_and_download(workflow: dict) -> list[dict]:
+    def _check_models_exist_and_download(workflow: dict) -> Any:
         job_id = modal.current_function_call_id()
-        missing = original_check_models(workflow)
-        downloadable = [m for m in missing if m.get("download_url")]
+        missing_result = original_check_models(workflow)
+        if isinstance(missing_result, tuple):
+            missing_models = list(missing_result[0] or [])
+        else:
+            missing_models = list(missing_result or [])
+
+        downloadable = [m for m in missing_models if m.get("download_url")]
         if not downloadable:
-            return missing
+            return missing_result
 
         total = len(downloadable)
+        download_params = inspect.signature(download_handler._download_url).parameters
         for index, model in enumerate(downloadable):
             url = model.get("download_url")
             if isinstance(url, list):
@@ -442,14 +455,18 @@ def _patch_handler_modules(worker, node_installer, download_handler) -> None:
                 message=f"Downloading missing model {index + 1}/{total}: {filename}",
                 percent=12 + (index / max(total, 1)) * 6,
             )
-            download_handler._download_url(
-                url,
-                dest_dir,
-                filename=filename,
-                job={"id": job_id, "input": {}},
-                item_index=index,
-                total_items=total,
-            )
+            kwargs: dict[str, Any] = {
+                "filename": filename,
+                "job": {"id": job_id, "input": {}},
+                "item_index": index,
+                "total_items": total,
+            }
+            if "timeout_sec" in download_params:
+                kwargs["timeout_sec"] = DOWNLOAD_TIMEOUT
+            expected_sha = model.get("sha256") or model.get("hash")
+            if expected_sha and "expected_sha" in download_params:
+                kwargs["expected_sha"] = expected_sha
+            download_handler._download_url(url, dest_dir, **kwargs)
 
         volume.commit()
         return original_check_models(workflow)
@@ -477,6 +494,88 @@ def _load_worker_handler():
     return worker.handler
 
 
+def _fetch_object_info() -> dict[str, Any]:
+    import urllib.request
+
+    with urllib.request.urlopen(f"http://{COMFY_HOST}/object_info", timeout=30) as r:
+        data = json.loads(r.read())
+    return data if isinstance(data, dict) else {}
+
+
+def _class_types_from_api_workflow(workflow: dict[str, Any]) -> set[str]:
+    return {
+        str(node.get("class_type"))
+        for node in workflow.values()
+        if isinstance(node, dict) and node.get("class_type")
+    }
+
+
+def _convert_ui_workflow_for_handler(
+    job_id: str,
+    job_input: dict[str, Any],
+    node_installer,
+) -> dict[str, Any]:
+    from comfy_gen import workflow_format
+
+    workflow = job_input.get("workflow")
+    if job_input.get("workflow_format") != "ui" and not workflow_format.is_ui_workflow(workflow):
+        return job_input
+    if not isinstance(workflow, dict):
+        raise ValueError("UI workflow payload must be a JSON object")
+    if node_installer is None:
+        raise RuntimeError("Cannot convert UI workflow because node_installer is not loaded")
+
+    _put_state(
+        job_id,
+        status="in_progress",
+        stage="workflow_convert",
+        message="Converting UI workflow to API format",
+        percent=4,
+    )
+
+    object_info = _fetch_object_info()
+    skeleton = workflow_format.ui_workflow_skeleton(workflow)
+    missing_types = sorted(_class_types_from_api_workflow(skeleton) - set(object_info.keys()))
+    if missing_types:
+        _put_state(
+            job_id,
+            status="in_progress",
+            stage="node_check",
+            message=f"Installing {len(missing_types)} missing custom node(s) for UI conversion",
+            percent=6,
+        )
+
+        def _node_progress(msg: str) -> None:
+            _put_state(job_id, status="in_progress", stage="node_check", message=msg, percent=7)
+
+        installed = node_installer.ensure_nodes(skeleton, progress_fn=_node_progress)
+        if installed:
+            volume.commit()
+        object_info = _fetch_object_info()
+
+    still_missing = sorted(_class_types_from_api_workflow(skeleton) - set(object_info.keys()))
+    if still_missing:
+        names = ", ".join(still_missing)
+        raise RuntimeError(
+            "Cannot convert UI workflow because ComfyUI does not expose "
+            f"object_info for: {names}"
+        )
+
+    converted = workflow_format.ui_to_api_workflow(workflow, object_info)
+    converted_input = dict(job_input)
+    converted_input["workflow"] = converted
+    converted_input["workflow_format"] = "api"
+    converted_input["ui_workflow_converted"] = True
+    _put_state(
+        job_id,
+        status="in_progress",
+        stage="workflow_convert",
+        message=f"Converted UI workflow ({len(converted)} nodes)",
+        percent=8,
+    )
+    return converted_input
+
+
 @app.function(
     image=image,
     gpu=GPU_TYPE,
@@ -498,6 +597,8 @@ def run_job(job_input: dict[str, Any]) -> dict[str, Any]:
     try:
         _start_comfyui()
         handler = _load_worker_handler()
+        node_installer = sys.modules.get("node_installer")
+        job_input = _convert_ui_workflow_for_handler(job_id, job_input, node_installer)
         result = handler({"id": job_id, "input": job_input})
         if not isinstance(result, dict):
             result = {"ok": True, "result": result}

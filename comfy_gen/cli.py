@@ -363,15 +363,17 @@ def main() -> None:
         "submit",
         help="Submit a ComfyUI workflow for execution on Modal",
         description=(
-            "Submit a ComfyUI API-format workflow to the deployed Modal app.\n"
-            "Local LoadImage file paths are uploaded to S3 automatically. Missing\n"
-            "custom nodes are resolved through ComfyUI-Manager and installed onto\n"
-            "the Modal Volume. Manager-known missing models are downloaded to the\n"
-            "Modal Volume before the workflow is queued.\n"
+            "Submit a ComfyUI workflow to the deployed Modal app. API-format\n"
+            "workflows run directly; UI-format workflows are converted inside a\n"
+            "headless Modal ComfyUI worker using the live object_info schema.\n"
+            "Local LoadImage file paths are uploaded to S3 automatically.\n"
+            "Missing custom nodes are resolved through ComfyUI-Manager and\n"
+            "installed onto the Modal Volume. Manager-known missing models are\n"
+            "downloaded to the Modal Volume before the workflow is queued.\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_submit.add_argument("workflow", help="Path to ComfyUI workflow JSON file (API format)")
+    p_submit.add_argument("workflow", help="Path to ComfyUI workflow JSON file (API or UI format)")
     p_submit.add_argument("--input", action="append", metavar="NODE_ID=FILE_PATH", help="Upload a local file for a specific node")
     p_submit.add_argument("--override", action="append", metavar="NODE_ID.PARAM=VALUE", help="Override a workflow parameter")
     p_submit.add_argument("--timeout", type=int, help="Max seconds to wait for completion")

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
@@ -16,25 +15,6 @@ def _upload_input(local_path: str, cfg: dict | None = None) -> str:
     from comfy_gen import storage
 
     return storage.upload_input(local_path, config=cfg)
-
-
-def _detect_file_inputs(workflow: dict) -> dict[str, dict]:
-    """Find LoadImage nodes in a workflow that reference local files."""
-    file_inputs = {}
-    for node_id, node in workflow.items():
-        if not isinstance(node, dict):
-            continue
-        class_type = node.get("class_type", "")
-        if class_type != "LoadImage":
-            continue
-        image_val = node.get("inputs", {}).get("image", "")
-        if isinstance(image_val, str) and image_val and os.path.isfile(image_val):
-            file_inputs[node_id] = {
-                "field": "image",
-                "local_path": image_val,
-                "filename": Path(image_val).name,
-            }
-    return file_inputs
 
 
 def _format_comfy_errors(comfy_err: dict) -> str:
@@ -128,6 +108,25 @@ def _progress(elapsed: int, status: str, prog: dict[str, Any]) -> None:
         output.log(f"[{elapsed}s] {status}")
 
 
+def _find_node(workflow: dict[str, Any], node_id: str, workflow_kind: str) -> dict[str, Any]:
+    if workflow_kind == "api":
+        node = workflow.get(str(node_id), {})
+        return node if isinstance(node, dict) else {}
+    if workflow_kind == "ui":
+        for node in workflow.get("nodes", []):
+            if isinstance(node, dict) and str(node.get("id")) == str(node_id):
+                return node
+    return {}
+
+
+def _node_class_type(node: dict[str, Any], workflow_kind: str) -> str:
+    if workflow_kind == "api":
+        return str(node.get("class_type") or "")
+    if workflow_kind == "ui":
+        return str(node.get("type") or "")
+    return ""
+
+
 def submit(
     workflow_path: str,
     file_inputs: dict[str, str] | None = None,
@@ -138,16 +137,20 @@ def submit(
 ) -> dict[str, Any]:
     """Submit a workflow to the deployed Modal app."""
     from comfy_gen import modal_client
+    from comfy_gen import workflow_format as wf_format
 
     with open(workflow_path) as f:
         workflow = json.load(f)
 
-    has_class_type = any(isinstance(v, dict) and "class_type" in v for v in workflow.values())
-    if not has_class_type:
-        raise ValueError("Workflow is not in ComfyUI API format (no class_type found). Export via 'Save (API Format)'.")
+    workflow_kind = wf_format.workflow_format(workflow)
+    if workflow_kind == "unknown":
+        raise ValueError(
+            "Workflow is not recognized as ComfyUI API or UI format. "
+            "Use an API workflow or a UI workflow exported from ComfyUI."
+        )
 
     payload_file_inputs = {}
-    auto_detected = _detect_file_inputs(workflow)
+    auto_detected = wf_format.detect_file_inputs(workflow)
     for node_id, info in auto_detected.items():
         output.log(f"Uploading input file: {info['local_path']}")
         url = _upload_input(info["local_path"])
@@ -161,8 +164,8 @@ def submit(
         for node_id, local_path in file_inputs.items():
             output.log(f"Uploading input file for node {node_id}: {local_path}")
             url = _upload_input(local_path)
-            node = workflow.get(node_id, {})
-            class_type = node.get("class_type", "") if isinstance(node, dict) else ""
+            node = _find_node(workflow, node_id, workflow_kind)
+            class_type = _node_class_type(node, workflow_kind)
             field = "video" if class_type in ("VHS_LoadVideo", "LoadVideo") else "image"
             payload_file_inputs[node_id] = {
                 "field": field,
@@ -172,6 +175,7 @@ def submit(
 
     job_input: dict[str, Any] = {
         "workflow": workflow,
+        "workflow_format": workflow_kind,
         "timeout": timeout,
     }
     if payload_file_inputs:
