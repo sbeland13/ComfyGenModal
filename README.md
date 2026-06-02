@@ -18,6 +18,15 @@ comfy-gen submit workflow.json
 
 Outputs still use S3-compatible storage so results can be accessed from your local machine, scripts, and downstream tools.
 
+## Development & Testing
+
+```bash
+pip install -e '.[dev]'    # installs pytest + pytest-mock
+python3 -m pytest tests/
+```
+
+Tests for the serverless worker (`serverless-runtime/`) use the `dispatch_command` fixture in `tests/conftest.py`, which mirrors the worker's command-dispatch path so routing is exercised end-to-end.
+
 ## Installation
 
 Requires Python 3.11+ and Modal authentication.
