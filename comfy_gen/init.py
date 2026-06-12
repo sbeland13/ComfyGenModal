@@ -265,6 +265,8 @@ def run(args: argparse.Namespace) -> None:
     try:
         modal_client.ensure_modal_objects(volume_name, jobs_name)
     except Exception as e:
+        if "Modal SDK is required" in str(e):
+            output.error(str(e))
         output.error(
             "Modal authentication failed. Run 'modal setup' or configure "
             f"MODAL_TOKEN_ID/MODAL_TOKEN_SECRET, then retry. Details: {e}"

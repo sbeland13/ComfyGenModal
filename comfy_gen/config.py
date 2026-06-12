@@ -43,6 +43,12 @@ ENV_MAP = {
     "COMFY_GEN_POLL_INTERVAL": "poll_interval_seconds",
 }
 
+PASSTHROUGH_ENV_VARS = {
+    "MODAL_TOKEN_ID",
+    "MODAL_TOKEN_SECRET",
+    "MODAL_PROFILE",
+}
+
 
 def _load_dotenv() -> dict[str, str]:
     """Load .env file from the project directory if it exists."""
@@ -57,8 +63,12 @@ def _load_dotenv() -> dict[str, str]:
                     if not line or line.startswith("#"):
                         continue
                     key, _, value = line.partition("=")
-                    if key.strip() in ENV_MAP:
-                        env_vals[ENV_MAP[key.strip()]] = value.strip()
+                    env_key = key.strip()
+                    env_value = value.strip()
+                    if env_key in ENV_MAP:
+                        env_vals[ENV_MAP[env_key]] = env_value
+                    if env_key in PASSTHROUGH_ENV_VARS and env_value and env_key not in os.environ:
+                        os.environ[env_key] = env_value
             break
     return env_vals
 

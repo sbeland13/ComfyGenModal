@@ -12,11 +12,15 @@ from comfy_gen import output
 
 
 def _modal():
+    from comfy_gen import config
+
+    config.load()
     try:
         import modal
     except ImportError as e:
         raise RuntimeError(
-            "The Modal SDK is required. Install it with: pip install modal"
+            "The Modal SDK is required in the Python environment running comfy-gen. "
+            f"Install it with: {sys.executable} -m pip install modal"
         ) from e
     return modal
 

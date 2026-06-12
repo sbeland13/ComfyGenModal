@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import types
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -397,6 +398,138 @@ def _patch_download_timeouts(download_handler) -> None:
     download_handler._MODAL_TIMEOUT_PATCHED = True
 
 
+def _civitai_download_url_with_token(url: str, token: str | None) -> str:
+    if not token:
+        return url
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.netloc.lower() != "civitai.com":
+        return url
+    if not parsed.path.startswith("/api/download/models/"):
+        return url
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    if any(key == "token" for key, _value in query):
+        return url
+    query.append(("token", token))
+    return urllib.parse.urlunsplit(
+        parsed._replace(query=urllib.parse.urlencode(query))
+    )
+
+
+def _patch_modal_civitai_auth(download_handler) -> None:
+    """Avoid forwarding CivitAI bearer auth to signed storage redirects."""
+    if getattr(download_handler, "_MODAL_CIVITAI_AUTH_PATCHED", False):
+        return
+
+    required = (
+        "_civitai_version_metadata",
+        "_find_file_by_sha",
+        "_download_url",
+        "CivitaiMetadataError",
+        "CIVITAI_DOWNLOAD_BASE",
+    )
+    if not all(hasattr(download_handler, name) for name in required):
+        return
+
+    def _download_civitai(
+        version_id: str,
+        dest_dir: str,
+        timeout_sec: int = 600,
+        job: dict | None = None,
+        item_index: int = 0,
+        total_items: int = 1,
+        progress_callback=None,
+        expected_sha: str | None = None,
+        fallback_filename: str | None = None,
+    ) -> dict:
+        job_tag = (job.get("id", "")[:8] if job else "") or "civitai"
+        print(
+            f"[job {job_tag}] civitai: entering _download_civitai for version {version_id}",
+            flush=True,
+        )
+        os.makedirs(dest_dir, exist_ok=True)
+
+        token = os.environ.get("CIVITAI_TOKEN") or None
+        try:
+            meta = download_handler._civitai_version_metadata(version_id, token=token)
+        except download_handler.CivitaiMetadataError as exc:
+            if not (expected_sha and fallback_filename):
+                raise RuntimeError(
+                    f"CivitAI API metadata lookup failed for version {version_id}: {exc}"
+                ) from exc
+            print(
+                f"[job {job_tag}] civitai: metadata lookup failed for version "
+                f"{version_id}: {exc}; using caller filename+sha fallback",
+                flush=True,
+            )
+            meta = {
+                "filename": fallback_filename,
+                "sha256": expected_sha.lower(),
+                "download_url": f"{download_handler.CIVITAI_DOWNLOAD_BASE}/{version_id}",
+            }
+        if meta is None:
+            raise RuntimeError(
+                f"CivitAI API metadata lookup failed for version {version_id}: "
+                "no metadata returned"
+            )
+
+        api_filename = meta["filename"]
+        api_sha = meta["sha256"]
+        download_url = _civitai_download_url_with_token(meta["download_url"], token)
+        effective_sha = (expected_sha or api_sha).lower()
+        print(
+            f"[job {job_tag}] civitai: api reports {api_filename} "
+            f"sha256={effective_sha[:12]}... url={download_url}",
+            flush=True,
+        )
+
+        cached_hit = download_handler._find_file_by_sha(
+            dest_dir,
+            effective_sha,
+            hint_name=api_filename,
+        )
+        if cached_hit:
+            size_mb = round(os.path.getsize(cached_hit) / (1024 * 1024), 1)
+            print(
+                f"[job {job_tag}] civitai: cached hit - sha256 match for "
+                f"{os.path.basename(cached_hit)}; skipping download.",
+                flush=True,
+            )
+            if progress_callback:
+                progress_callback({
+                    "type": "download_done",
+                    "file_index": item_index,
+                    "file": os.path.basename(cached_hit),
+                    "cached": True,
+                    "bytes": os.path.getsize(cached_hit),
+                    "sha256": effective_sha,
+                })
+            return {
+                "filename": os.path.basename(cached_hit),
+                "path": cached_hit,
+                "size_mb": size_mb,
+                "cached": True,
+                "sha256": effective_sha,
+            }
+
+        info = download_handler._download_url(
+            url=download_url,
+            dest_dir=dest_dir,
+            filename=api_filename,
+            job=job,
+            item_index=item_index,
+            total_items=total_items,
+            progress_callback=progress_callback,
+            timeout_sec=timeout_sec,
+            expected_sha=effective_sha,
+            extra_aria_args=[],
+        )
+        info["sha256"] = effective_sha
+        return info
+
+    download_handler._download_civitai = _download_civitai
+    download_handler._MODAL_CIVITAI_AUTH_PATCHED = True
+
+
 def _model_dest(missing_model: dict[str, Any]) -> str:
     save_path = str(missing_model.get("save_path") or "").strip().replace("\\", "/")
     model_type = str(missing_model.get("model_type") or "").lower()
@@ -490,6 +623,7 @@ def _load_worker_handler():
     node_installer = importlib.import_module("node_installer")
     download_handler = importlib.import_module("download_handler")
     _patch_download_timeouts(download_handler)
+    _patch_modal_civitai_auth(download_handler)
     _patch_handler_modules(worker, node_installer, download_handler)
     return worker.handler
 

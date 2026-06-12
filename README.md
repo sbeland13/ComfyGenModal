@@ -34,7 +34,7 @@ Tests for the serverless worker (`serverless-runtime/`) use the `dispatch_comman
 Requires Python 3.11+ and Modal authentication.
 
 ```bash
-git clone https://github.com/Hearmeman24/ComfyGen.git
+git clone https://github.com/sbeland13/ComfyGenModal
 cd ComfyGen
 pip install -e .
 modal setup
@@ -193,6 +193,9 @@ Config is read from:
 | `modal_volume_name` | Modal Volume for models/custom nodes | `COMFY_GEN_MODAL_VOLUME_NAME` | `comfy-gen-comfyui` |
 | `modal_secret_name` | Modal Secret for S3/CivitAI credentials | `COMFY_GEN_MODAL_SECRET_NAME` | `comfy-gen-storage` |
 | `modal_jobs_name` | Modal Dict for job progress | `COMFY_GEN_MODAL_JOBS_NAME` | `comfy-gen-jobs` |
+| - | Modal token ID fallback | `MODAL_TOKEN_ID` | - |
+| - | Modal token secret fallback | `MODAL_TOKEN_SECRET` | - |
+| - | Modal profile name | `MODAL_PROFILE` | `default` |
 | `aws_access_key_id` | S3 access key | `AWS_ACCESS_KEY_ID` | - |
 | `aws_secret_access_key` | S3 secret key | `AWS_SECRET_ACCESS_KEY` | - |
 | `s3_bucket` | S3 bucket name | `S3_BUCKET` | - |
@@ -202,7 +205,7 @@ Config is read from:
 | `timeout_seconds` | Max wait for workflow completion | `COMFY_GEN_TIMEOUT` | `1200` |
 | `poll_interval_seconds` | Status poll interval | `COMFY_GEN_POLL_INTERVAL` | `3` |
 
-Modal authentication is handled by the Modal SDK via `modal setup` or `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`.
+Modal authentication is handled by the Modal SDK via `modal setup` or `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`. If you use a project `.env`, ComfyGen loads those Modal token variables into the process before importing the Modal SDK.
 
 ## Storage
 
